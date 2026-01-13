@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
 # 引入 MoviePy
-from moviepy import (
+from moviepy.editor import (
     vfx, 
     afx, 
     ImageClip, 

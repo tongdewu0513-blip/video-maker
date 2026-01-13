@@ -18,24 +18,27 @@ import asyncio
 from moviepy.editor import (
     ImageClip, 
     AudioFileClip, 
+    VideoFileClip, # 新增：读取视频文件
     concatenate_videoclips, 
     CompositeAudioClip,
     concatenate_audioclips
 )
 
 # --- 0. 全局配置 ---
-st.set_page_config(page_title="AI 视频工坊 (云端轻量版)", page_icon="☁️", layout="wide")
+st.set_page_config(page_title="AI 视频工坊 (硬盘缓存版)", page_icon="💾", layout="wide")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIO_DIR = os.path.join(BASE_DIR, "audio_files")
 IMAGE_DIR = os.path.join(BASE_DIR, "image_files")
+TEMP_DIR = os.path.join(BASE_DIR, "temp_clips") # 临时视频存放区
 BGM_DIR = os.path.join(BASE_DIR, "bgm_assets")
 OUTPUT_VIDEO = os.path.join(BASE_DIR, "final_output.mp4")
-# 字体文件名
 FONT_FILENAME = "font.ttf"
 FONT_PATH = os.path.join(BASE_DIR, FONT_FILENAME)
 
-for d in [AUDIO_DIR, IMAGE_DIR, BGM_DIR]:
+# 暴力清理重建目录
+if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+for d in [AUDIO_DIR, IMAGE_DIR, BGM_DIR, TEMP_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
 # --- 1. 资源初始化 ---
@@ -52,12 +55,10 @@ def download_file(url, filepath):
     return False
 
 def init_resources():
-    # 强制下载字体 (云端没有微软雅黑，必须用这个)
     font_url = "https://raw.githubusercontent.com/StellarCN/scp_zh/master/fonts/SimHei.ttf"
     if not os.path.exists(FONT_PATH):
         download_file(font_url, FONT_PATH)
 
-    # 音乐
     bgm_list = {
         "tech.mp3": "https://cdn.pixabay.com/download/audio/2022/03/15/audio_c8c8a73467.mp3",
         "epic.mp3": "https://cdn.pixabay.com/download/audio/2022/03/10/audio_c8c8a73467.mp3"
@@ -133,26 +134,24 @@ def gen_assets_sync(script, voice, key, run_id):
     v = "zh-CN-YunxiNeural" if voice == "中文" else "en-US-GuyNeural"
     asyncio.run(_gen_assets(script, v, key, run_id))
 
-# --- 4. 渲染 (云端低耗版) ---
+# --- 4. 渲染 (硬盘缓存 + 内存释放) ---
 def draw_subtitle(img_path, text):
     if not os.path.exists(img_path): return None
     try:
         img = Image.open(img_path).convert("RGBA")
-        # 🔴 降级到 720P，防止云端内存溢出
-        img = img.resize((1280, 720), Image.LANCZOS)
+        # 🔴 强制 480P (854x480)，这是云端不卡死的黄金分辨率
+        img = img.resize((854, 480), Image.LANCZOS)
         draw = ImageDraw.Draw(img)
         
-        # 字体加载 (云端必须用相对路径)
-        try: font = ImageFont.truetype(FONT_FILENAME, 35) # 字号适中
+        try: font = ImageFont.truetype(FONT_FILENAME, 25) 
         except: font = ImageFont.load_default()
         
-        # 换行
         w_limit = 28 if any('\u4e00' <= c <= '\u9fff' for c in text) else 45
         text = textwrap.fill(text, width=w_limit)
         
         bbox = draw.multiline_textbbox((0,0), text, font=font, align="center")
         tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-        x, y = (1280-tw)//2, 720-th-50
+        x, y = (854-tw)//2, 480-th-30
         
         draw.rectangle([x-10, y-10, x+tw+10, y+th+10], fill=(0,0,0,160))
         draw.multiline_text((x, y), text, font=font, fill='white', align="center")
@@ -161,37 +160,55 @@ def draw_subtitle(img_path, text):
     except: return None
 
 def render(script, bgm_file, run_id):
-    clips = []
+    temp_files = [] # 存储临时小视频路径
     
-    # 状态条
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(script)
     
+    # 1. 逐个生成临时视频文件 (每做一个清理一个内存)
     for i, scene in enumerate(script):
-        status_text.text(f"🎬 渲染片段 {i+1}/{total} (720P)...")
+        status_text.text(f"🔨 正在硬盘生成片段: {i+1}/{total} (内存已释放)...")
+        
         aud = os.path.join(AUDIO_DIR, f"{i}_{run_id}.mp3")
         img = os.path.join(IMAGE_DIR, f"{i}_{run_id}.jpg")
+        temp_out = os.path.join(TEMP_DIR, f"clip_{i}_{run_id}.mp4")
         
         if os.path.exists(aud) and os.path.exists(img):
             try:
+                # 生成单个 Clip
                 audio = AudioFileClip(aud)
                 img_arr = draw_subtitle(img, scene['narration'])
+                
                 if img_arr is not None:
-                    # 静态图片 + 音频，最省资源
                     clip = ImageClip(img_arr).set_duration(audio.duration + 0.2).set_audio(audio)
-                    clips.append(clip)
-                    # 显式关闭，释放内存
-                    audio.close() 
-            except: pass
+                    
+                    # 🔴 立即写入硬盘！不要留在内存里！
+                    # fps=8 极低帧率保证速度
+                    clip.write_videofile(temp_out, fps=8, codec="libx264", audio_codec="aac", preset="ultrafast", verbose=False, logger=None)
+                    
+                    # 显式关闭，释放内存句柄
+                    clip.close()
+                    audio.close()
+                    del clip
+                    del audio
+                    
+                    temp_files.append(temp_out)
+            except Exception as e:
+                print(f"片段 {i} 失败: {e}")
+                
         progress_bar.progress((i+1)/total * 0.8)
     
-    if not clips: return None
+    if not temp_files: return None
     
-    status_text.text("⚡ 正在合并 (Chain Mode)...")
-    # 使用 chain 模式，不重编码，速度快
+    # 2. 最终缝合 (Chain Mode 极速模式)
+    status_text.text("🔗 正在缝合硬盘文件...")
+    
+    # 读取所有临时文件
+    clips = [VideoFileClip(f) for f in temp_files]
     final = concatenate_videoclips(clips, method="chain")
     
+    # BGM 简单混音
     if bgm_file and os.path.exists(bgm_file):
         try:
             bgm = AudioFileClip(bgm_file)
@@ -199,23 +216,25 @@ def render(script, bgm_file, run_id):
                 loops = math.ceil(final.duration/bgm.duration)+1
                 bgm = concatenate_audioclips([bgm] * loops)
             bgm = bgm.set_duration(final.duration).volumex(0.15)
-            
-            # 混音需要 compose 模式，为了云端稳定，我们尝试 composite
-            final_audio = CompositeAudioClip([final.audio, bgm])
-            final.audio = final_audio
+            final.audio = CompositeAudioClip([final.audio, bgm])
         except: pass
     
-    status_text.text("💾 最终导出 (单线程防卡死)...")
-    
-    # 🔴 关键配置：threads=1 (单线程), preset='ultrafast' (极速), fps=10 (够用了)
+    status_text.text("💾 最终导出...")
     final.write_videofile(
         OUTPUT_VIDEO, 
-        fps=10, 
+        fps=8, 
         codec="libx264", 
         audio_codec="aac", 
-        preset="ultrafast", 
+        preset="ultrafast",
         threads=1
     )
+    
+    # 清理所有句柄
+    final.close()
+    for c in clips: c.close()
+    # 删除临时文件
+    try: shutil.rmtree(TEMP_DIR)
+    except: pass
     
     progress_bar.progress(1.0)
     status_text.empty()
@@ -229,7 +248,7 @@ with st.sidebar:
     voice = st.selectbox("配音", ["中文男声", "中文女声"] if lang=="中文" else ["English Male", "English Female"])
     bgm_up = st.file_uploader("BGM", type="mp3")
 
-st.title("☁️ AI 视频工坊 (云端轻量版)")
+st.title("💾 AI 视频工坊 (硬盘缓存版)")
 
 tab1, tab2 = st.tabs(["PDF", "文本"])
 raw = ""

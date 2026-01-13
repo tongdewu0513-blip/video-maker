@@ -1,0 +1,8 @@
+streamlit
+edge-tts
+requests
+PyPDF2
+Pillow
+numpy
+moviepy
+asyncio
